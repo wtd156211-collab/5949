@@ -53,4 +53,81 @@ BM25，参数固定为 `k1 = 1.2`、`b = 0.75`，不额外做平滑之外的处�
 
 ## 索引文件布局
 
-由实现决定，写完后补在这里：索引文件有哪些、各自的字段与编码、增量更新时改动哪一部分。
+实现位于 `kbsearch/`（仅标准库）。索引目录如下：
+
+```
+index_dir/
+├── meta.json        索引元数据（UTF-8 JSON）
+├── slots.bin        文档定长槽位，每个内部编号 8 字节
+├── live.bitmap      存活内部编号位图（4 字节大端计数 + 位图字节）
+├── stopwords.txt    建库时停用词表副本（查询时不用再找原始文件）
+├── terms/xx/yyyy…   每个词项一个内容寻址文件（倒排表）
+└── docs/xx/xxxxxxxx 每个内部编号一个文档清单
+```
+
+- **内部编号**：文档入库时分配的 32 位整数，外部编号（文件名去 `.txt`）不直接进倒排表；
+  槽位删除后可复用，避免反复增删导致文件膨胀。
+- **`meta.json`**：`version`、`n_docs`（N）、`total_length`、`avgdl`、`k1`、`b`、`stopwords`。
+  增删时只更新这几个聚合计数，不全量重算。
+- **`slots.bin`**：固定 8 字节定长记录 `<BxxxI`，即 1 字节存活状态 + 3 字节填充 +
+  4 字节文档长度 `|d|`。查询打分时按内部编号 `seek` 随机读，不需要把全部文档长度放进内存。
+- **`live.bitmap`**：内部编号是否存活。NOT / 补集按位图迭代判定，不物化大列表；
+  十万篇文档位图本身只有十几 KB。
+- **词项倒排文件 `terms/`**：文件名是词项 UTF-8 字节的 SHA-1（按前两位十六进制分桶），
+  内容寻址意味着同词项重写不变内容不会产生垃圾文件。文件布局：
+
+  ```
+  "CA01" | vint(term_len) | term_utf8 | vint(df)
+  重复 df 次：
+      vint(doc_delta)   内部编号相对上一篇的差值（首篇为绝对值），按编号升序
+      vint(tf)          该词在文档中的出现次数
+      vint(pos1)        第 1 次出现的位置（位置编号从 1 开始）
+      vint(pos_delta…)  后续位置相对上一位置的差值
+  ```
+
+  位置随倒排表落盘，短语匹配就是读相关词的位置链做相邻位置连接，不需要额外结构。
+- **文档清单 `docs/`**：内部编号十六进制命名，记录外部编号和该文档涉及的词项集合。
+  删除时据此精确知道要改哪些词项文件；查询排序时按需读出外部编号。
+- **变长整数**：小端 7 位分组 LEB128（高位=还有后续字节）。
+
+**增量更新**：新增/删除一篇文档时，只重写该文档涉及的词项倒排文件、对应文档清单、
+槽位与位图，以及 `meta.json` 里的 N / 总长度 / avgdl；其他词项文件原样不动。
+同一 doc_id 重新导入按替换处理。批量导入用 `Writer.add_documents(...)` 一次提交，
+每个词项文件只写一遍（建几万篇索引就是几秒）；单篇增删各自提交，只动受影响部分。
+
+**查询内存**：查询只把语法树中出现的词项倒排表读进内存（同一查询内每个词项只读一次），
+布尔集合只保留命中文档编号，文档长度走槽位随机读，NOT 走位图迭代——常驻内存不随文档总量增长。
+
+## 模块与使用
+
+- `kbsearch/tokenizer.py`：分词口径（切分、小写、标点、停用词）；
+- `kbsearch/parser.py`：查询词法与递归下降解析，输出 AST；
+- `kbsearch/codec.py`：变长整数、槽位、位图等磁盘编码；
+- `kbsearch/postings.py`：词项倒排表读写与增量合并；
+- `kbsearch/index.py`：`Index.create`、`Writer` 增删、文档映射；
+- `kbsearch/searcher.py`：AST 求值、短语位置连接、BM25 打分与稳定排序；
+- `tests/`：unittest 测试，`python -m unittest discover -s tests` 运行。
+
+```python
+from kbsearch import Index
+
+Index.create("idx_dir", "samples/stopwords.txt")
+with Index("idx_dir").writer() as writer:
+    writer.add_documents([("doc-01", "文档正文……")])  # 批量
+    writer.add_document("doc-02", "单篇增量")
+    writer.delete_document("doc-01")
+
+with Index("idx_dir").searcher() as searcher:
+    results = searcher.search('(倒排索引 OR 扫描) AND 文档')
+    # [("doc-02", 2.13), ...]，分数降序、同分时编号 UTF-8 字节序升序
+```
+
+命令行：
+
+```bash
+python -m kbsearch build  idx_dir samples/docs --stopwords samples/stopwords.txt
+python -m kbsearch add    idx_dir doc-11 path/to/doc-11.txt
+python -m kbsearch delete idx_dir doc-11
+python -m kbsearch query  idx_dir '检索 AND NOT 慢'
+python -m kbsearch batch  idx_dir --queries samples/queries.txt --tsv
+```
