@@ -1,0 +1,12 @@
+检索	doc-02,doc-04,doc-10,doc-01
+倒排索引	doc-02,doc-09
+"倒排索引"	doc-09,doc-02
+"state of the art"	doc-04
+索引 AND 文档	doc-09,doc-02,doc-05,doc-07
+检索 OR 扫描	doc-02,doc-04,doc-10,doc-01
+检索 AND NOT 慢	doc-02,doc-04,doc-10
+(倒排索引 OR 扫描) AND 文档	doc-02,doc-09
+文档 AND 位置	doc-09
+State AND Art	doc-04
+区块链	
+kubernetes	
