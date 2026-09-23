@@ -53,4 +53,42 @@ BM25，参数固定为 `k1 = 1.2`、`b = 0.75`，不额外做平滑之外的处�
 
 ## 索引文件布局
 
-由实现决定，写完后补在这里：索引文件有哪些、各自的字段与编码、增量更新时改动哪一部分。
+索引是一个目录，全部用 JSON（UTF-8、`sort_keys`）落盘，写入先写临时文件再 `os.replace`，避免半截文件：
+
+```
+index_dir/
+    meta.json          {"num_docs": 文档总数 N, "total_len": 全部文档词元数之和}
+                       avgdl = total_len / num_docs，查询时现算
+    docs.json          {doc_id: 文档词元数}，NOT 查询的全集也取自这里
+    terms.json         {term: df}，词表大小，查询时常驻内存
+    stopwords.txt      建索引时拷贝的停用词表，保证查询与建索引口径一致
+    postings/xx.json   256 个 shard，xx 是 term 的 sha1 首字节（十六进制）：
+                       {term: [[doc_id, doc_len, [pos, ...]], ...]}
+                       doc_len 冗余在每条倒排记录里，打分时不需要加载
+                       任何随文档数增长的结构；pos 从 1 开始连续编号
+    forward/xx.json    256 个 shard，xx 是 doc_id 的 sha1 首字节：
+                       {doc_id: {term: [pos, ...]}}，删除文档时靠它找到
+                       该文档的所有词
+```
+
+查询时内存占用：`terms.json`（词表大小）+ 查询词命中的 postings shard + 结果集，都不随文档总数增长；只有 `NOT` 需要全集时会读 `docs.json`。
+
+增量更新：新增/删除一篇文档只重写它命中的 postings shard（该文档不同的词数级别）和它所在的 forward shard，再更新 `terms.json`、`docs.json`、`meta.json`，不做全量重建。删除时从 forward shard 拿到该文档的词表，逐个从对应 postings shard 里摘掉该文档并递减 df。
+
+## 代码结构
+
+- `searchlib/tokenizer.py`：分词（切分、小写、丢标点、停用词、位置编号）
+- `searchlib/query.py`：查询词法分析与递归下降解析（NOT > AND > OR，隐式 AND，括号，双引号短语）
+- `searchlib/index.py`：`IndexWriter`（构建/增量增删/commit 落盘）与 `IndexReader`（按需加载 shard）
+- `searchlib/engine.py`：`SearchEngine.search()`，布尔求值 + BM25 打分 + 稳定排序
+- `main.py`：命令行入口，见下
+- `tests/`：unittest 测试，`python3 -m unittest discover -s tests`
+
+## 命令行用法
+
+```
+python3 main.py build  --index IDX --docs samples/docs --stopwords samples/stopwords.txt
+python3 main.py add    --index IDX path/to/new-doc.txt
+python3 main.py delete --index IDX doc-01
+python3 main.py search --index IDX '(倒排索引 OR 扫描) AND 文档'
+```
